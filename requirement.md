@@ -495,7 +495,6 @@ crates/
     ckc-core
     ckc-parser
     ckc-ir
-    ckc-indexer
     ckc-semantic
     ckc-graph
     ckc-storage
@@ -575,19 +574,22 @@ Summary
 
 # 十二、支持语言
 
-第一阶段
+第一阶段（Phase 1）
+
+* Python
+
+第二阶段（Phase 2）
 
 * Rust
-* Python
 * TypeScript
 
-第二阶段
+第三阶段（Phase 3）
 
 * Java
 * Go
 * C#
 
-第三阶段
+第四阶段
 
 任何 Tree-sitter 支持的语言。
 
@@ -598,11 +600,10 @@ Summary
 ## Phase 1（MVP）
 
 * Repository Scanner
-* Rust Parser
-* Knowledge IR
-* SQLite
-* Qdrant
-* Graph Query
+* Python Parser（基于 tree-sitter）
+* Knowledge IR（语法层：Node + Edge）
+* SQLite（图存储 + 查询）
+* 结构化 CLI 查询（callers / callees / imports / dependencies）
 * CLI
 
 ---
@@ -610,15 +611,17 @@ Summary
 ## Phase 2
 
 * 增量编译
-* 多语言
-* API
-* LLM Compiler
+* Rust / TypeScript 支持
+* Embedding + Qdrant 向量存储
+* LLM Compiler（Purpose / Summary / Business Capability）
 * Semantic Cache
+* HTTP API
 
 ---
 
 ## Phase 3
 
+* Java / Go / C# 支持
 * IDE SDK
 * GitHub App
 * VS Code Extension
