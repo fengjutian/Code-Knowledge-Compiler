@@ -142,6 +142,7 @@ dependencies = [
  "ckc-ir",
  "ckc-parser",
  "ignore",
+ "serde_json",
  "tracing",
 ]
 

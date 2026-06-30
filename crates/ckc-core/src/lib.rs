@@ -3,8 +3,11 @@
 //! ckc-core drives the end-to-end compilation flow:
 //!   1. Scan the repository for source files (`Scanner`)
 //!   2. Dispatch each file to the appropriate language parser
-//!   3. Persist the Knowledge IR to the graph store
-//!   4. Return build statistics
+//!   3. Resolve cross-file symbol references (`SymbolResolver`)
+//!   4. Persist the Knowledge IR to the graph store
+//!   5. Return build statistics
+
+mod resolver;
 
 use ckc_graph::GraphStore;
 use ckc_ir::IrBuildResult;
@@ -158,6 +161,14 @@ impl Compiler {
                     });
                 }
             }
+        }
+
+        // ── Cross-file symbol resolution ──────────────────────────────────
+        let file_paths = resolver::collect_file_paths(&all_nodes);
+        let sym_resolver = resolver::SymbolResolver::new(&all_nodes);
+        let resolved_count = sym_resolver.resolve_calls(&mut all_edges, &file_paths);
+        if resolved_count > 0 {
+            tracing::info!("Resolved {} cross-file call(s)", resolved_count);
         }
 
         // Persist all collected nodes and edges
