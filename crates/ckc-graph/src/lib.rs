@@ -244,7 +244,7 @@ impl GraphStore {
 
     // ── Internal ────────────────────────────────────────────────────────
 
-    /// BFS traversal following outgoing edges.
+    /// BFS traversal following outgoing edges (find callees).
     fn traverse_down(
         &self,
         name: &str,
@@ -253,39 +253,80 @@ impl GraphStore {
     ) -> Result<Vec<IrNode>, GraphError> {
         let mut results = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        let mut current: Vec<String> = self.find_node_keys_by_name(name)?;
+        let is_calls = edge_kind == "calls";
 
-        // Prepare statement once, outside the loop
-        let mut stmt = self.conn.prepare(
-            "SELECT n.id, n.kind, n.name, n.file_path, n.line_start, n.line_end,
-                    n.col_start, n.col_end, n.visibility, n.metadata_json,
-                    n.semantic_json, n.hash
-             FROM edges e JOIN nodes n ON n.id = e.target_id
-             WHERE e.source_id = ?1 AND e.kind = ?2",
-        )?;
+        // Initial: find all nodes matching `name` by name
+        let mut current_names: Vec<String> = vec![name.to_string()];
 
         for _ in 0..depth {
-            if current.is_empty() {
+            if current_names.is_empty() {
                 break;
             }
-            let mut next = Vec::new();
-            for key in &current {
-                if !visited.insert(key.clone()) {
+            let mut next_names = Vec::new();
+
+            for current_name in &current_names {
+                if !visited.insert(current_name.clone()) {
                     continue;
                 }
-                let rows = stmt.query_map(params![key, edge_kind], row_to_node)?;
-                for row in rows {
-                    let node = row?;
-                    next.push(node.id.to_key());
-                    results.push(node);
+
+                if is_calls {
+                    // Find caller nodes by name, get their keys, find outgoing calls
+                    let caller_keys = self.find_node_keys_by_name(current_name)?;
+                    for ck in &caller_keys {
+                        // Get all call targets for this caller
+                        let mut stmt = self.conn.prepare(
+                            "SELECT e.metadata_json FROM edges e
+                             WHERE e.source_id = ?1 AND e.kind = 'calls'",
+                        )?;
+                        let meta_rows: Vec<String> = stmt
+                            .query_map(params![ck], |row| row.get::<_, String>(0))?
+                            .collect::<Result<Vec<_>, _>>()?;
+                        for meta_json in &meta_rows {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(meta_json) {
+                                if let Some(target_name) = parsed.get("target_name").and_then(|v| v.as_str()) {
+                                    // Look up target node by name
+                                    let target_keys = self.find_node_keys_by_name(target_name)?;
+                                    for tk in &target_keys {
+                                        let mut node_stmt = self.conn.prepare(
+                                            "SELECT id, kind, name, file_path, line_start, line_end,
+                                                    col_start, col_end, visibility, metadata_json,
+                                                    semantic_json, hash
+                                             FROM nodes WHERE id = ?1",
+                                        )?;
+                                        if let Ok(node) = node_stmt.query_row(params![tk], row_to_node) {
+                                            next_names.push(node.name.clone());
+                                            results.push(node);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let caller_keys = self.find_node_keys_by_name(current_name)?;
+                    for ck in &caller_keys {
+                        let mut stmt = self.conn.prepare(
+                            "SELECT n.id, n.kind, n.name, n.file_path, n.line_start, n.line_end,
+                                    n.col_start, n.col_end, n.visibility, n.metadata_json,
+                                    n.semantic_json, n.hash
+                             FROM edges e JOIN nodes n ON n.id = e.target_id
+                             WHERE e.source_id = ?1 AND e.kind = ?2",
+                        )?;
+                        let rows = stmt.query_map(params![ck, edge_kind], row_to_node)?;
+                        for row in rows {
+                            let node = row?;
+                            next_names.push(node.id.to_key());
+                            results.push(node);
+                        }
+                    }
                 }
             }
-            current = next;
+            current_names = next_names;
         }
         Ok(results)
     }
 
-    /// BFS traversal following incoming edges.
+    /// BFS traversal following incoming edges (find callers).
     fn traverse_up(
         &self,
         name: &str,
@@ -294,34 +335,63 @@ impl GraphStore {
     ) -> Result<Vec<IrNode>, GraphError> {
         let mut results = Vec::new();
         let mut visited = std::collections::HashSet::new();
-        let mut current: Vec<String> = self.find_node_keys_by_name(name)?;
+        let is_calls = edge_kind == "calls";
 
-        // Prepare statement once, outside the loop
-        let mut stmt = self.conn.prepare(
-            "SELECT n.id, n.kind, n.name, n.file_path, n.line_start, n.line_end,
-                    n.col_start, n.col_end, n.visibility, n.metadata_json,
-                    n.semantic_json, n.hash
-             FROM edges e JOIN nodes n ON n.id = e.source_id
-             WHERE e.target_id = ?1 AND e.kind = ?2",
-        )?;
+        let mut current_names: Vec<String> = vec![name.to_string()];
 
         for _ in 0..depth {
-            if current.is_empty() {
+            if current_names.is_empty() {
                 break;
             }
-            let mut next = Vec::new();
-            for key in &current {
-                if !visited.insert(key.clone()) {
+            let mut next_names = Vec::new();
+
+            for current_name in &current_names {
+                if !visited.insert(current_name.clone()) {
                     continue;
                 }
-                let rows = stmt.query_map(params![key, edge_kind], row_to_node)?;
-                for row in rows {
-                    let node = row?;
-                    next.push(node.id.to_key());
-                    results.push(node);
+
+                if is_calls {
+                    // Find callers: edges where target_name (in metadata) matches current_name exactly
+                    let mut stmt = self.conn.prepare(
+                        "SELECT e.source_id FROM edges e
+                         WHERE e.kind = 'calls'
+                           AND json_extract(e.metadata_json, '$.target_name') = ?1",
+                    )?;
+                    let caller_keys: Vec<String> = stmt
+                        .query_map(params![current_name], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for ck in &caller_keys {
+                        let mut node_stmt = self.conn.prepare(
+                            "SELECT id, kind, name, file_path, line_start, line_end,
+                                    col_start, col_end, visibility, metadata_json,
+                                    semantic_json, hash
+                             FROM nodes WHERE id = ?1",
+                        )?;
+                        if let Ok(node) = node_stmt.query_row(params![ck], row_to_node) {
+                            next_names.push(node.name.clone());
+                            results.push(node);
+                        }
+                    }
+                } else {
+                    let target_keys = self.find_node_keys_by_name(current_name)?;
+                    for tk in &target_keys {
+                        let mut stmt = self.conn.prepare(
+                            "SELECT n.id, n.kind, n.name, n.file_path, n.line_start, n.line_end,
+                                    n.col_start, n.col_end, n.visibility, n.metadata_json,
+                                    n.semantic_json, n.hash
+                             FROM edges e JOIN nodes n ON n.id = e.source_id
+                             WHERE e.target_id = ?1 AND e.kind = ?2",
+                        )?;
+                        let rows = stmt.query_map(params![tk, edge_kind], row_to_node)?;
+                        for row in rows {
+                            let node = row?;
+                            next_names.push(node.id.to_key());
+                            results.push(node);
+                        }
+                    }
                 }
             }
-            current = next;
+            current_names = next_names;
         }
         Ok(results)
     }
@@ -524,9 +594,12 @@ mod tests {
 
         store.upsert_node(&a).unwrap();
         store.upsert_node(&b).unwrap();
-        store
-            .upsert_edge(&IrEdge::new(a.id.clone(), b.id.clone(), EdgeKind::Calls))
-            .unwrap();
+        let mut edge = IrEdge::new(a.id.clone(), b.id.clone(), EdgeKind::Calls);
+        edge.metadata.insert(
+            "target_name".into(),
+            serde_json::Value::String("b".into()),
+        );
+        store.upsert_edge(&edge).unwrap();
 
         let callers = store.callers("b", 1).unwrap();
         assert_eq!(callers.len(), 1);

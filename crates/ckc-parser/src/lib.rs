@@ -928,20 +928,23 @@ fn collect_call_edges(
 ) {
     if node.kind() == "call" {
         if let Some(func) = node.child_by_field_name("function") {
-            match func.kind() {
-                "identifier" => {
-                    if let Ok(name) = func.utf8_text(source.as_bytes()) {
-                        let callee_id = SymbolId::new(rel_path, Vec::new(), name, 0);
-                        edges.push(IrEdge::new(caller_id.clone(), callee_id, EdgeKind::Calls));
-                    }
-                }
-                "attribute" => {
-                    if let Ok(name) = func.utf8_text(source.as_bytes()) {
-                        let callee_id = SymbolId::new(rel_path, Vec::new(), name, 0);
-                        edges.push(IrEdge::new(caller_id.clone(), callee_id, EdgeKind::Calls));
-                    }
-                }
-                _ => {}
+            let callee_name = match func.kind() {
+                "identifier" => func.utf8_text(source.as_bytes()).ok().map(|s| s.to_string()),
+                "attribute" => func.utf8_text(source.as_bytes()).ok().map(|s| s.to_string()),
+                _ => None,
+            };
+            if let Some(ref name) = callee_name {
+                let mut edge = IrEdge::new(
+                    caller_id.clone(),
+                    SymbolId::new(rel_path, Vec::new(), name, 0), // target_id is placeholder
+                    EdgeKind::Calls,
+                );
+                // Store the actual callee name for name-based resolution
+                edge.metadata.insert(
+                    "target_name".into(),
+                    serde_json::Value::String(name.clone()),
+                );
+                edges.push(edge);
             }
         }
     }
