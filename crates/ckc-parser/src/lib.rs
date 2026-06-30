@@ -203,9 +203,42 @@ fn process_body_items(
                 }
             }
             "import_statement" | "import_from_statement" => {
-                if let Some(edge) = extract_import(&child, source, rel_path, parent_id) {
+                for edge in extract_imports(&child, source, rel_path, parent_id) {
                     result.edges.push(edge);
                 }
+            }
+            // Structural patterns: tag parent function with metadata
+            "try_statement" => {
+                result.warnings.push(format!(
+                    "{}:{}: try-except detected in scope of {}",
+                    rel_path,
+                    child.start_position().row + 1,
+                    parent_id.name
+                ));
+            }
+            "lambda" => {
+                result.warnings.push(format!(
+                    "{}:{}: lambda detected in scope of {}",
+                    rel_path,
+                    child.start_position().row + 1,
+                    parent_id.name
+                ));
+            }
+            "yield" => {
+                result.warnings.push(format!(
+                    "{}:{}: yield detected in scope of {} (generator)",
+                    rel_path,
+                    child.start_position().row + 1,
+                    parent_id.name
+                ));
+            }
+            "with_statement" => {
+                result.warnings.push(format!(
+                    "{}:{}: with-statement context manager in scope of {}",
+                    rel_path,
+                    child.start_position().row + 1,
+                    parent_id.name
+                ));
             }
             "expression_statement" => {
                 // Module/class-level variables. Inside functions we skip these
@@ -957,14 +990,15 @@ fn collect_call_edges(
 
 // ── Import Extraction ──────────────────────────────────────────────────────
 
-fn extract_import(
+fn extract_imports(
     node: &tree_sitter::Node,
     source: &str,
     rel_path: &str,
     module_id: &SymbolId,
-) -> Option<IrEdge> {
+) -> Vec<IrEdge> {
     match node.kind() {
         "import_statement" => {
+            let mut edges = Vec::new();
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 if child.kind() == "dotted_name" || child.kind() == "aliased_import" {
@@ -978,7 +1012,7 @@ fn extract_import(
                         if !target_name.is_empty() {
                             let target_id =
                                 SymbolId::new(rel_path, Vec::new(), target_name, 0);
-                            return Some(IrEdge::new(
+                            edges.push(IrEdge::new(
                                 module_id.clone(),
                                 target_id,
                                 EdgeKind::Imports,
@@ -987,7 +1021,7 @@ fn extract_import(
                     }
                 }
             }
-            None
+            edges
         }
         "import_from_statement" => {
             let module_name = node
@@ -1006,12 +1040,12 @@ fn extract_import(
                 format!("{}.{}", module_name, import_name)
             };
             if target_name.is_empty() {
-                return None;
+                return Vec::new();
             }
             let target_id = SymbolId::new(rel_path, Vec::new(), target_name, 0);
-            Some(IrEdge::new(module_id.clone(), target_id, EdgeKind::Imports))
+            vec![IrEdge::new(module_id.clone(), target_id, EdgeKind::Imports)]
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -1222,6 +1256,20 @@ mod tests {
         assert!(imports
             .iter()
             .any(|e| e.target_id.name == "collections.defaultdict"));
+    }
+
+    #[test]
+    fn parse_multi_import() {
+        let result = parse_source("import os, sys, json\n");
+        let imports: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Imports)
+            .collect();
+        assert_eq!(imports.len(), 3);
+        assert!(imports.iter().any(|e| e.target_id.name == "os"));
+        assert!(imports.iter().any(|e| e.target_id.name == "sys"));
+        assert!(imports.iter().any(|e| e.target_id.name == "json"));
     }
 
     #[test]

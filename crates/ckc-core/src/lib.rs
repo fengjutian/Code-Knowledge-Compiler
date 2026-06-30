@@ -18,6 +18,17 @@ use std::time::Instant;
 #[cfg(feature = "llm")]
 use ckc_llm::SemanticCompiler;
 
+// ── File Hashing (for incremental builds) ─────────────────────────────────
+
+/// Compute a content hash for a file (using std hasher — fast but not cryptographic).
+fn file_content_hash(path: &Path) -> Result<u64, std::io::Error> {
+    use std::hash::Hasher;
+    let content = std::fs::read_to_string(path)?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&content, &mut hasher);
+    Ok(hasher.finish())
+}
+
 // ── Scanner ────────────────────────────────────────────────────────────────
 
 /// Detected language for a source file.
@@ -117,11 +128,202 @@ impl Compiler {
         }
     }
 
-    /// Run a full build: scan → parse → persist.
+    /// Run a full build: scan → parse → resolve → persist.
     ///
-    /// If `db_path` is `None`, an in-memory database is used (for quick exploration).
-    /// Otherwise, results are persisted to a SQLite file.
+    /// If `db_path` is `None`, an in-memory database is used.
     pub fn build(
+        &self,
+        db_path: Option<&Path>,
+    ) -> Result<(GraphStore, BuildStats, IrBuildResult), anyhow::Error> {
+        let start = Instant::now();
+
+        let source_files = self.scanner.scan()?;
+        let files_scanned = source_files.len() as u64;
+
+        let store = match db_path {
+            Some(p) => GraphStore::open(p)?,
+            None => GraphStore::open_in_memory()?,
+        };
+
+        let python_parser = PythonParser::new();
+
+        let mut total_nodes = 0u64;
+        let mut total_edges = 0u64;
+        let mut files_parsed = 0u64;
+        let mut files_failed = 0u64;
+        let mut all_nodes = Vec::new();
+        let mut all_edges = Vec::new();
+        let mut diagnostics = Vec::new();
+        #[cfg(feature = "llm")]
+        let mut source_snippets: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        for sf in &source_files {
+            #[cfg(feature = "llm")]
+            {
+                if let Ok(src) = std::fs::read_to_string(&sf.path) {
+                    let rel = sf.path.strip_prefix(self.scanner.root()).unwrap_or(&sf.path).display().to_string();
+                    source_snippets.insert(rel, src);
+                }
+            }
+            match self.parse_file(&python_parser, sf) {
+                Ok(parse_result) => {
+                    files_parsed += 1;
+                    total_nodes += parse_result.nodes.len() as u64;
+                    total_edges += parse_result.edges.len() as u64;
+                    all_nodes.extend(parse_result.nodes);
+                    all_edges.extend(parse_result.edges);
+                }
+                Err(e) => {
+                    files_failed += 1;
+                    diagnostics.push(ckc_ir::BuildDiagnostic {
+                        file_path: sf.path.display().to_string(),
+                        line: 0,
+                        message: e.to_string(),
+                        severity: ckc_ir::DiagnosticSeverity::Error,
+                    });
+                }
+            }
+        }
+
+        let file_paths = resolver::collect_file_paths(&all_nodes);
+        let sym_resolver = resolver::SymbolResolver::new(&all_nodes);
+        let resolved_count = sym_resolver.resolve_calls(&mut all_edges, &file_paths);
+        if resolved_count > 0 {
+            tracing::info!("Resolved {} cross-file call(s)", resolved_count);
+        }
+
+        #[cfg(feature = "llm")]
+        {
+            if let Ok(provider) = ckc_llm::OpenAiProvider::from_env() {
+                let mut llm_compiler = SemanticCompiler::new(provider);
+                match llm_compiler.enrich_batch(&mut all_nodes, &source_snippets) {
+                    Ok(count) => {
+                        if count > 0 { tracing::info!("LLM enriched {} node(s)", count); }
+                    }
+                    Err(e) => { tracing::warn!("LLM enrichment failed: {}", e); }
+                }
+            }
+        }
+
+        store.persist_batch(&all_nodes, &all_edges)?;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let stats = BuildStats { files_scanned, files_parsed, files_failed, total_nodes, total_edges, duration_ms };
+        let build_result = IrBuildResult { nodes: all_nodes, edges: all_edges, files_parsed, files_failed, diagnostics };
+
+        Ok((store, stats, build_result))
+    }
+
+    /// Run an incremental build: only re-parse changed files.
+    ///
+    /// Requires a persistent DB to compare file hashes. On first run, falls
+    /// back to a full build.
+    pub fn build_incremental(
+        &self,
+        db_path: &Path,
+    ) -> Result<(GraphStore, BuildStats, IrBuildResult, u64), anyhow::Error> {
+        let start = Instant::now();
+        let source_files = self.scanner.scan()?;
+        let files_scanned = source_files.len() as u64;
+
+        let store = GraphStore::open(db_path)?;
+
+        // Load previous file hashes from meta table
+        let mut prev_hashes: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        // We store hashes as "hash:<file_path>" in meta
+        for sf in &source_files {
+            let rel = sf.path.strip_prefix(self.scanner.root())
+                .unwrap_or(&sf.path)
+                .display()
+                .to_string();
+            if let Some(val) = store.get_meta(&format!("hash:{}", rel)) {
+                if let Ok(h) = val.parse::<u64>() {
+                    prev_hashes.insert(rel, h);
+                }
+            }
+        }
+
+        let python_parser = PythonParser::new();
+        let mut total_nodes = 0u64;
+        let mut total_edges = 0u64;
+        let mut files_parsed = 0u64;
+        let mut files_skipped = 0u64;
+        let mut files_failed = 0u64;
+        let mut all_nodes = Vec::new();
+        let mut all_edges = Vec::new();
+        let mut diagnostics = Vec::new();
+
+        for sf in &source_files {
+            let rel = sf.path.strip_prefix(self.scanner.root())
+                .unwrap_or(&sf.path)
+                .display()
+                .to_string();
+
+            let current_hash = file_content_hash(&sf.path)?;
+            let changed = prev_hashes.get(&rel).map_or(true, |prev| *prev != current_hash);
+
+            if !changed {
+                files_skipped += 1;
+                // Update hash in meta (no change, but keep current)
+                store.set_meta(&format!("hash:{}", rel), &current_hash.to_string())?;
+                continue;
+            }
+
+            match self.parse_file(&python_parser, sf) {
+                Ok(parse_result) => {
+                    files_parsed += 1;
+                    total_nodes += parse_result.nodes.len() as u64;
+                    total_edges += parse_result.edges.len() as u64;
+                    all_nodes.extend(parse_result.nodes);
+                    all_edges.extend(parse_result.edges);
+                }
+                Err(e) => {
+                    files_failed += 1;
+                    diagnostics.push(ckc_ir::BuildDiagnostic {
+                        file_path: sf.path.display().to_string(),
+                        line: 0,
+                        message: e.to_string(),
+                        severity: ckc_ir::DiagnosticSeverity::Error,
+                    });
+                }
+            }
+
+            // Store hash
+            store.set_meta(&format!("hash:{}", rel), &current_hash.to_string())?;
+        }
+
+        // Resolve and persist if there are new/changed nodes
+        if !all_nodes.is_empty() {
+            let file_paths = resolver::collect_file_paths(&all_nodes);
+            let sym_resolver = resolver::SymbolResolver::new(&all_nodes);
+            sym_resolver.resolve_calls(&mut all_edges, &file_paths);
+            store.persist_batch(&all_nodes, &all_edges)?;
+        }
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let stats = BuildStats {
+            files_scanned,
+            files_parsed,
+            files_failed,
+            total_nodes,
+            total_edges,
+            duration_ms,
+        };
+        let build_result = IrBuildResult {
+            nodes: all_nodes,
+            edges: all_edges,
+            files_parsed,
+            files_failed,
+            diagnostics,
+        };
+
+        Ok((store, stats, build_result, files_skipped))
+    }
+
+    /// Full build (kept for backward compatibility).
+    #[allow(dead_code)]
+    pub fn build_full(
         &self,
         db_path: Option<&Path>,
     ) -> Result<(GraphStore, BuildStats, IrBuildResult), anyhow::Error> {

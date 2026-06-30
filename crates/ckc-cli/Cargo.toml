@@ -12,7 +12,11 @@ path = "src/main.rs"
 ckc-core = { path = "../ckc-core" }
 ckc-ir = { path = "../ckc-ir" }
 ckc-graph = { path = "../ckc-graph" }
+serde_json.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tower-http = { version = "0.6", features = ["cors"] }

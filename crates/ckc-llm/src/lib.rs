@@ -247,13 +247,13 @@ fn node_kind_label(kind: ckc_ir::NodeKind) -> &'static str {
 
 // ── Semantic Compiler ──────────────────────────────────────────────────────
 
-/// Orchestrates LLM-based semantic enrichment.
+/// Orchestrates LLM-based semantic enrichment with caching.
 pub struct SemanticCompiler<P: LlmProvider> {
     provider: P,
-    /// Maximum nodes to send in a single batch.
     batch_size: usize,
-    /// Skip nodes that already have semantic info (Phase 2 semantic cache).
     skip_enriched: bool,
+    /// In-memory cache: (name, signature_hash) → SemanticInfo
+    cache: HashMap<(String, u64), SemanticInfo>,
 }
 
 impl<P: LlmProvider> SemanticCompiler<P> {
@@ -262,14 +262,13 @@ impl<P: LlmProvider> SemanticCompiler<P> {
             provider,
             batch_size: 5,
             skip_enriched: true,
+            cache: HashMap::new(),
         }
     }
 
-    /// Enrich a batch of nodes with semantic metadata.
-    ///
-    /// Only Function, Method, and Class nodes are sent to the LLM.
+    /// Enrich a batch of nodes, using cache to avoid repeated LLM calls.
     pub fn enrich_batch(
-        &self,
+        &mut self,
         nodes: &mut [IrNode],
         source_snippets: &HashMap<String, String>,
     ) -> Result<usize, LlmError> {
@@ -292,14 +291,23 @@ impl<P: LlmProvider> SemanticCompiler<P> {
         for chunk in candidates.chunks(self.batch_size) {
             for &idx in chunk {
                 let node = &nodes[idx];
+
+                // Check cache first
+                let cache_key = (node.name.clone(), node.id.signature_hash);
+                if let Some(cached) = self.cache.get(&cache_key) {
+                    nodes[idx].semantic = Some(cached.clone());
+                    enriched += 1;
+                    continue;
+                }
+
                 let file_key = &node.id.file_path;
                 let snippet = source_snippets.get(file_key).map(|s| s.as_str());
-
                 let user_prompt = build_user_prompt(node, snippet);
 
                 match self.provider.chat(SYSTEM_PROMPT, &user_prompt) {
                     Ok(response) => {
                         if let Ok(info) = parse_semantic_response(&response) {
+                            self.cache.insert(cache_key, info.clone());
                             nodes[idx].semantic = Some(info);
                             enriched += 1;
                         }
@@ -317,6 +325,11 @@ impl<P: LlmProvider> SemanticCompiler<P> {
         }
 
         Ok(enriched)
+    }
+
+    /// Number of cached entries.
+    pub fn cache_size(&self) -> usize {
+        self.cache.len()
     }
 }
 

@@ -79,7 +79,17 @@ impl GraphStore {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            -- Full-text search on symbol names and file paths
+            CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
+                name, file_path, content='nodes', content_rowid='rowid'
+            );
             ",
+        )?;
+        // Populate FTS (idempotent)
+        self.conn.execute_batch(
+            "INSERT OR IGNORE INTO nodes_fts(rowid, name, file_path)
+             SELECT rowid, name, file_path FROM nodes;",
         )?;
         Ok(())
     }
@@ -122,8 +132,7 @@ impl GraphStore {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn set_meta(&self, key: &str, value: &str) -> Result<(), GraphError> {
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), GraphError> {
         self.conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
             params![key, value],
@@ -240,6 +249,21 @@ impl GraphStore {
                 row.get::<_, i64>(0)
             })
             .unwrap_or(0) as u64
+    }
+
+    /// Full-text search on symbol names.
+    pub fn search(&self, query: &str) -> Result<Vec<IrNode>, GraphError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.id, n.kind, n.name, n.file_path, n.line_start, n.line_end,
+                    n.col_start, n.col_end, n.visibility, n.metadata_json,
+                    n.semantic_json, n.hash
+             FROM nodes_fts f JOIN nodes n ON n.rowid = f.rowid
+             WHERE nodes_fts MATCH ?1
+             ORDER BY rank
+             LIMIT 50",
+        )?;
+        let rows = stmt.query_map(params![query], row_to_node)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(GraphError::from)
     }
 
     // ── Internal ────────────────────────────────────────────────────────

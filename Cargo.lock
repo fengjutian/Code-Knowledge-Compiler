@@ -159,6 +159,7 @@ dependencies = [
  "ckc-graph",
  "ckc-ir",
  "clap",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

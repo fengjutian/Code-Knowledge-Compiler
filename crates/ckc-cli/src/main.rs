@@ -41,13 +41,18 @@ enum Command {
         /// Defaults to `<repo>/.ckc/ckc.db`.
         #[arg(short, long)]
         db: Option<PathBuf>,
+        /// Force a full rebuild (ignore incremental cache).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Query the compiled Knowledge IR.
     Query {
-        /// Path to the SQLite database (or repository root if using default path).
         #[arg(short, long, default_value = ".")]
         db: PathBuf,
+        /// Output results as JSON.
+        #[arg(long)]
+        json: bool,
 
         #[command(subcommand)]
         sub: QuerySub,
@@ -104,9 +109,14 @@ enum QuerySub {
     },
     /// List all nodes, optionally filtered by kind.
     ListNodes {
-        /// Optional node kind filter (function, class, method, module, etc.).
         #[arg(short, long)]
         kind: Option<String>,
+    },
+    /// Full-text search on symbol names.
+    Search {
+        /// Search query (FTS5 syntax).
+        #[arg(short, long)]
+        query: String,
     },
 }
 
@@ -122,8 +132,8 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Scan { path } => cmd_scan(&path),
-        Command::Build { path, db } => cmd_build(&path, db.as_deref()),
-        Command::Query { db, sub } => cmd_query(&db, sub),
+        Command::Build { path, db, force } => cmd_build(&path, db.as_deref(), force),
+        Command::Query { db, sub, json } => cmd_query(&db, sub, json),
         Command::Status { path } => cmd_status(&path),
     }
 }
@@ -145,88 +155,91 @@ fn cmd_scan(path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_build(path: &PathBuf, db: Option<&Path>) -> anyhow::Result<()> {
+fn cmd_build(path: &PathBuf, db: Option<&Path>, force: bool) -> anyhow::Result<()> {
     let compiler = Compiler::new(path);
 
     let db_path = match db {
         Some(p) => p.to_path_buf(),
         None => {
             let default_dir = path.join(".ckc");
-            std::fs::create_dir_all(&default_dir)
-                .context("creating .ckc directory")?;
+            std::fs::create_dir_all(&default_dir).context("creating .ckc directory")?;
             default_dir.join("ckc.db")
         }
     };
 
-    println!("Building Knowledge IR for {} ...", path.display());
-    let (_store, stats, result) = compiler.build(Some(&db_path))?;
-
-    println!(
-        "Done in {}ms — {} files scanned, {} parsed, {} failed",
-        stats.duration_ms, stats.files_scanned, stats.files_parsed, stats.files_failed
-    );
-    println!(
-        "  Nodes: {}  Edges: {}  DB: {}",
-        stats.total_nodes,
-        stats.total_edges,
-        db_path.display()
-    );
-
-    // Print any diagnostics (parse errors)
-    for diag in &result.diagnostics {
-        let prefix = match diag.severity {
-            ckc_ir::DiagnosticSeverity::Error => "ERROR",
-            ckc_ir::DiagnosticSeverity::Warning => "WARNING",
-        };
-        eprintln!(
-            "  {} [{}:{}] {}",
-            prefix, diag.file_path, diag.line, diag.message
+    let (total_nodes, total_edges) = if !force && db_path.exists() {
+        println!("Building Knowledge IR for {} (incremental)...", path.display());
+        let (_store, stats, _result, skipped) = compiler.build_incremental(&db_path)?;
+        println!(
+            "Done in {}ms — {} files scanned, {} changed, {} skipped, {} failed",
+            stats.duration_ms, stats.files_scanned, stats.files_parsed, skipped, stats.files_failed
         );
-    }
+        (stats.total_nodes, stats.total_edges)
+    } else {
+        println!("Building Knowledge IR for {} ...", path.display());
+        let (_store, stats, result) = compiler.build(Some(&db_path))?;
+        println!(
+            "Done in {}ms — {} files scanned, {} parsed, {} failed",
+            stats.duration_ms, stats.files_scanned, stats.files_parsed, stats.files_failed
+        );
+        for diag in &result.diagnostics {
+            let prefix = match diag.severity {
+                ckc_ir::DiagnosticSeverity::Error => "ERROR",
+                ckc_ir::DiagnosticSeverity::Warning => "WARNING",
+            };
+            eprintln!("  {} [{}:{}] {}", prefix, diag.file_path, diag.line, diag.message);
+        }
+        (stats.total_nodes, stats.total_edges)
+    };
 
+    println!("  Nodes: {}  Edges: {}  DB: {}", total_nodes, total_edges, db_path.display());
     Ok(())
 }
 
-fn cmd_query(db: &PathBuf, sub: QuerySub) -> anyhow::Result<()> {
+fn cmd_query(db: &PathBuf, sub: QuerySub, json: bool) -> anyhow::Result<()> {
     let db_path = resolve_db_path(db)?;
     let store = ckc_graph::GraphStore::open(&db_path)?;
 
     match sub {
         QuerySub::Callers { name, depth } => {
             let nodes = store.callers(&name, depth)?;
-            print_nodes(&nodes, &format!("Callers of '{}'", name));
+            output_nodes(&nodes, &format!("Callers of '{}'", name), json);
         }
         QuerySub::Callees { name, depth } => {
             let nodes = store.callees(&name, depth)?;
-            print_nodes(&nodes, &format!("Callees of '{}'", name));
+            output_nodes(&nodes, &format!("Callees of '{}'", name), json);
         }
         QuerySub::Imports { file } => {
-            let edges = store.imports_of_file(&file)?;
-            println!("Imports of '{}':", file);
-            for e in &edges {
-                println!("  → {}", e.target_id.name);
+            if json {
+                let edges = store.imports_of_file(&file)?;
+                println!("{}", serde_json::to_string_pretty(&edges)?);
+            } else {
+                let edges = store.imports_of_file(&file)?;
+                println!("Imports of '{}':", file);
+                for e in &edges {
+                    println!("  → {}", e.target_id.name);
+                }
             }
         }
         QuerySub::Dependencies { name } => {
             let nodes = store.dependencies(&name)?;
-            print_nodes(&nodes, &format!("Dependencies of '{}'", name));
+            output_nodes(&nodes, &format!("Dependencies of '{}'", name), json);
         }
         QuerySub::Dependents { name } => {
             let nodes = store.dependents(&name)?;
-            print_nodes(&nodes, &format!("Dependents of '{}'", name));
+            output_nodes(&nodes, &format!("Dependents of '{}'", name), json);
         }
         QuerySub::Neighbors { name, depth } => {
             let nodes = store.neighbors(&name, depth)?;
-            print_nodes(&nodes, &format!("Neighbors of '{}' (depth {})", name, depth));
+            output_nodes(&nodes, &format!("Neighbors of '{}' (depth {})", name, depth), json);
         }
         QuerySub::ListNodes { kind } => {
             let nodes = store.list_nodes(kind.as_deref())?;
-            if let Some(k) = &kind {
-                println!("Nodes of kind '{}':", k);
-            } else {
-                println!("All nodes:");
-            }
-            print_nodes(&nodes, "");
+            output_nodes(&nodes, "", json);
+        }
+        QuerySub::Search { query } => {
+            let nodes = store.search(&query)?;
+            output_nodes(&nodes, &format!("Search '{}'", query), json);
         }
     }
 
@@ -278,7 +291,11 @@ fn resolve_db_path(path: &PathBuf) -> anyhow::Result<PathBuf> {
     }
 }
 
-fn print_nodes(nodes: &[ckc_ir::IrNode], header: &str) {
+fn output_nodes(nodes: &[ckc_ir::IrNode], header: &str, json: bool) {
+    if json {
+        println!("{}", serde_json::to_string_pretty(nodes).unwrap_or_default());
+        return;
+    }
     if !header.is_empty() {
         println!("{} ({} results):", header, nodes.len());
     }
