@@ -1,0 +1,18 @@
+[package]
+name = "ckc-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ckc"
+path = "src/main.rs"
+
+[dependencies]
+ckc-core = { path = "../ckc-core" }
+ckc-ir = { path = "../ckc-ir" }
+ckc-graph = { path = "../ckc-graph" }
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
