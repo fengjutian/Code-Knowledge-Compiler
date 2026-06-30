@@ -65,6 +65,7 @@ impl LanguageParser for RustParser {
             match child.kind() {
                 "function_item" => {
                     if let Some(node) = extract_rust_function(&child, &source, &rel_path, &module_path, &module_id) {
+                        collect_rust_call_edges(&child, &source, &rel_path, &node.id, &mut result.edges);
                         result.edges.push(IrEdge::new(module_id.clone(), node.id.clone(), EdgeKind::Contains));
                         result.nodes.push(node);
                     }
@@ -88,9 +89,10 @@ impl LanguageParser for RustParser {
                     }
                 }
                 "impl_item" => {
-                    if let Some((impl_node, methods)) = extract_rust_impl(&child, &source, &rel_path, &module_path) {
+                    if let Some((impl_node, methods, mut method_edges)) = extract_rust_impl(&child, &source, &rel_path, &module_path) {
                         result.nodes.push(impl_node);
                         result.nodes.extend(methods);
+                        result.edges.append(&mut method_edges);
                     }
                 }
                 "mod_item" => {
@@ -101,7 +103,14 @@ impl LanguageParser for RustParser {
                 }
                 "use_declaration" => {
                     if let Ok(text) = child.utf8_text(source.as_bytes()) {
-                        let target_id = SymbolId::new(&rel_path, Vec::new(), text.trim().to_string(), 0);
+                        // Strip "use " prefix and ";" suffix
+                        let cleaned = text.trim()
+                            .strip_prefix("use ")
+                            .unwrap_or(text)
+                            .trim_end_matches(';')
+                            .trim()
+                            .to_string();
+                        let target_id = SymbolId::new(&rel_path, Vec::new(), cleaned, 0);
                         result.edges.push(IrEdge::new(module_id.clone(), target_id, EdgeKind::Imports));
                     }
                 }
@@ -153,7 +162,7 @@ fn extract_rust_trait(node: &tree_sitter::Node, source: &str, rel_path: &str, mo
     Some(IrNode { id, kind: NodeKind::Trait, name: name.to_string(), location: node_loc(node), visibility: Visibility::Public, metadata: Default::default(), semantic: None, hash: 0 })
 }
 
-fn extract_rust_impl(node: &tree_sitter::Node, source: &str, rel_path: &str, module_path: &[String]) -> Option<(IrNode, Vec<IrNode>)> {
+fn extract_rust_impl(node: &tree_sitter::Node, source: &str, rel_path: &str, module_path: &[String]) -> Option<(IrNode, Vec<IrNode>, Vec<IrEdge>)> {
     // Get the trait/type name being implemented
     let type_name = node.child_by_field_name("type")
         .or_else(|| node.child_by_field_name("trait"))
@@ -164,17 +173,19 @@ fn extract_rust_impl(node: &tree_sitter::Node, source: &str, rel_path: &str, mod
     let impl_node = IrNode { id: id.clone(), kind: NodeKind::TraitImpl, name: impl_name.clone(), location: node_loc(node), visibility: Visibility::Public, metadata: Default::default(), semantic: None, hash: 0 };
 
     let mut methods = Vec::new();
+    let mut edges = Vec::new();
     if let Some(body) = node.child_by_field_name("body") {
         for child in body.children(&mut body.walk()) {
             if child.kind() == "function_item" {
                 if let Some(mut m) = extract_rust_function(&child, source, rel_path, module_path, &id) {
                     m.kind = NodeKind::Method;
+                    collect_rust_call_edges(&child, source, rel_path, &m.id, &mut edges);
                     methods.push(m);
                 }
             }
         }
     }
-    Some((impl_node, methods))
+    Some((impl_node, methods, edges))
 }
 
 fn extract_rust_module(node: &tree_sitter::Node, source: &str, rel_path: &str, module_path: &[String], _parent: &SymbolId) -> Option<IrNode> {
@@ -183,6 +194,43 @@ fn extract_rust_module(node: &tree_sitter::Node, source: &str, rel_path: &str, m
     mp.push(name.to_string());
     let id = SymbolId::new(rel_path, mp, name, 0);
     Some(IrNode { id, kind: NodeKind::Module, name: name.to_string(), location: node_loc(node), visibility: Visibility::Public, metadata: Default::default(), semantic: None, hash: 0 })
+}
+
+/// Recursively collect call edges from Rust call expressions.
+fn collect_rust_call_edges(
+    node: &tree_sitter::Node,
+    source: &str,
+    rel_path: &str,
+    caller_id: &SymbolId,
+    edges: &mut Vec<IrEdge>,
+) {
+    if node.kind() == "call_expression" {
+        if let Some(func) = node.child_by_field_name("function") {
+            let callee_name = match func.kind() {
+                "identifier" | "scoped_identifier" | "field_expression" => {
+                    func.utf8_text(source.as_bytes()).ok().map(|s| s.to_string())
+                }
+                _ => None,
+            };
+            if let Some(ref name) = callee_name {
+                let mut edge = IrEdge::new(
+                    caller_id.clone(),
+                    SymbolId::new(rel_path, Vec::new(), name, 0),
+                    EdgeKind::Calls,
+                );
+                edge.metadata.insert(
+                    "target_name".into(),
+                    serde_json::Value::String(name.clone()),
+                );
+                edges.push(edge);
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_rust_call_edges(&child, source, rel_path, caller_id, edges);
+    }
 }
 
 #[cfg(test)]

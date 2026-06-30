@@ -59,8 +59,15 @@ impl SymbolResolver {
             let source_file = &edge.source_id.file_path;
             let imported_name = &edge.target_id.name;
 
-            // Try to resolve the import to a file
-            let resolved = self.resolve_import_to_file(imported_name, all_file_paths);
+            // For `from X import Y`, use the module path X to resolve
+            let module_name = edge.metadata.get("import_module").and_then(|v| v.as_str());
+            let resolved = if let Some(module) = module_name {
+                // Resolve using the module path, then map imported_name to that file
+                self.resolve_import_to_file(module, all_file_paths)
+            } else {
+                self.resolve_import_to_file(imported_name, all_file_paths)
+            };
+
             if let Some(resolved_file) = resolved {
                 file_imports
                     .entry(source_file.clone())
@@ -80,20 +87,22 @@ impl SymbolResolver {
         import_name: &str,
         all_file_paths: &HashSet<String>,
     ) -> Option<String> {
+        let sep = std::path::MAIN_SEPARATOR_STR;
+
         // Try as a direct module: "models" → "models.py"
         let direct = format!("{}.py", import_name);
         if all_file_paths.contains(&direct) {
             return Some(direct);
         }
 
-        // Try as a package: "pkg.payments" → "pkg/payments.py"
-        let dotted = format!("{}.py", import_name.replace('.', "/"));
+        // Try as a package: "pkg.payments" → "pkg/payments.py" (normalized for OS)
+        let dotted = format!("{}.py", import_name.replace('.', sep));
         if all_file_paths.contains(&dotted) {
             return Some(dotted);
         }
 
         // Try as package __init__: "pkg" → "pkg/__init__.py"
-        let init = format!("{}/__init__.py", import_name.replace('.', "/"));
+        let init = format!("{}{}__init__.py", import_name.replace('.', sep), sep);
         if all_file_paths.contains(&init) {
             return Some(init);
         }

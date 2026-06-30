@@ -1000,6 +1000,13 @@ fn extract_imports(
 ) -> Vec<IrEdge> {
     match node.kind() {
         "import_statement" => {
+            // tree-sitter-python may wrap "from ... import ..." as both import_statement
+            // and import_from_statement; skip the wrapping import_statement nodes.
+            let node_text = node.utf8_text(source.as_bytes()).unwrap_or("").trim();
+            if node_text.starts_with("from ") {
+                return Vec::new();
+            }
+
             let mut edges = Vec::new();
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
@@ -1039,13 +1046,20 @@ fn extract_imports(
             } else if import_name.is_empty() {
                 module_name.to_string()
             } else {
-                format!("{}.{}", module_name, import_name)
+                import_name.to_string()
             };
             if target_name.is_empty() {
                 return Vec::new();
             }
-            let target_id = SymbolId::new(rel_path, Vec::new(), target_name, 0);
-            vec![IrEdge::new(module_id.clone(), target_id, EdgeKind::Imports)]
+            let target_id = SymbolId::new(rel_path, Vec::new(), &target_name, 0);
+            let mut edge = IrEdge::new(module_id.clone(), target_id, EdgeKind::Imports);
+            if !module_name.is_empty() && !import_name.is_empty() {
+                edge.metadata.insert(
+                    "import_module".into(),
+                    serde_json::Value::String(module_name.to_string()),
+                );
+            }
+            vec![edge]
         }
         _ => Vec::new(),
     }
@@ -1255,9 +1269,9 @@ mod tests {
             .collect();
         assert_eq!(imports.len(), 2);
         assert!(imports.iter().any(|e| e.target_id.name == "os"));
-        assert!(imports
-            .iter()
-            .any(|e| e.target_id.name == "collections.defaultdict"));
+        // `from collections import defaultdict` stores the module in metadata
+        assert!(imports.iter().any(|e| e.target_id.name == "defaultdict"
+            && e.metadata.get("import_module").and_then(|v| v.as_str()) == Some("collections")));
     }
 
     #[test]
