@@ -37,7 +37,6 @@ struct JsonRpcError {
 }
 
 #[derive(Serialize)]
-#[derive(Serialize)]
 struct Tool {
     name: String,
     description: String,
