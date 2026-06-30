@@ -1,0 +1,14 @@
+[package]
+name = "ckc-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ckc-ir = { path = "../ckc-ir" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
+tokio = { version = "1", features = ["rt", "macros"] }

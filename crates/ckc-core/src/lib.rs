@@ -15,6 +15,9 @@ use ckc_parser::{LanguageParser, ParseError, ParseResult, PythonParser};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+#[cfg(feature = "llm")]
+use ckc_llm::SemanticCompiler;
+
 // ── Scanner ────────────────────────────────────────────────────────────────
 
 /// Detected language for a source file.
@@ -141,8 +144,25 @@ impl Compiler {
         let mut all_nodes = Vec::new();
         let mut all_edges = Vec::new();
         let mut diagnostics = Vec::new();
+        #[cfg(feature = "llm")]
+        let mut source_snippets: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         for sf in &source_files {
+            // Read source for LLM context (if feature enabled)
+            #[cfg(feature = "llm")]
+            {
+                if let Ok(src) = std::fs::read_to_string(&sf.path) {
+                    let rel = sf
+                        .path
+                        .strip_prefix(self.scanner.root())
+                        .unwrap_or(&sf.path)
+                        .display()
+                        .to_string();
+                    source_snippets.insert(rel, src);
+                }
+            }
+
             match self.parse_file(&python_parser, sf) {
                 Ok(parse_result) => {
                     files_parsed += 1;
@@ -169,6 +189,24 @@ impl Compiler {
         let resolved_count = sym_resolver.resolve_calls(&mut all_edges, &file_paths);
         if resolved_count > 0 {
             tracing::info!("Resolved {} cross-file call(s)", resolved_count);
+        }
+
+        // ── LLM Semantic Enrichment (optional) ─────────────────────────────
+        #[cfg(feature = "llm")]
+        {
+            if let Ok(provider) = ckc_llm::OpenAiProvider::from_env() {
+                let llm_compiler = SemanticCompiler::new(provider);
+                match llm_compiler.enrich_batch(&mut all_nodes, &source_snippets) {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::info!("LLM enriched {} node(s)", count);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("LLM enrichment failed: {}", e);
+                    }
+                }
+            }
         }
 
         // Persist all collected nodes and edges

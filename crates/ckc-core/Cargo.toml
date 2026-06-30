@@ -8,7 +8,12 @@ license.workspace = true
 ckc-ir = { path = "../ckc-ir" }
 ckc-parser = { path = "../ckc-parser" }
 ckc-graph = { path = "../ckc-graph" }
+ckc-llm = { path = "../ckc-llm", optional = true }
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 ignore = "0.4"
+
+[features]
+default = []
+llm = ["ckc-llm"]

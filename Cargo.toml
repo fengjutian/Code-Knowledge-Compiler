@@ -6,6 +6,7 @@ members = [
     "crates/ckc-graph",
     "crates/ckc-core",
     "crates/ckc-cli",
+    "crates/ckc-llm",
 ]
 
 [workspace.package]
