@@ -12,6 +12,7 @@ path = "src/main.rs"
 ckc-core = { path = "../ckc-core" }
 ckc-ir = { path = "../ckc-ir" }
 ckc-graph = { path = "../ckc-graph" }
+serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 clap.workspace = true
