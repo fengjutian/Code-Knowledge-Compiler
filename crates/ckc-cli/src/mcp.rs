@@ -11,6 +11,7 @@ use std::path::PathBuf;
 // ── JSON-RPC Types ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct JsonRpcRequest {
     jsonrpc: String,
     id: Option<serde_json::Value>,
