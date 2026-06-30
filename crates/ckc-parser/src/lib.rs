@@ -1,8 +1,10 @@
 //! Language parser abstraction and Python implementation.
 //!
 //! The [`LanguageParser`] trait defines the interface for extracting
-//! Knowledge IR nodes and edges from source code.  Phase 1 ships only
-//! [`PythonParser`]; trait abstraction is ready for Phase 2 multi-language.
+//! Knowledge IR nodes and edges from source code.
+
+mod rust_parser;
+pub use rust_parser::RustParser;
 
 use ckc_ir::{
     EdgeKind, IrEdge, IrNode, NodeKind, SemanticInfo, SourceLocation, SymbolId, Visibility,

@@ -4,13 +4,18 @@
 //! ckc scan   <path>        Scan a repository and list source files
 //! ckc build  <path>        Compile a repository into Knowledge IR
 //! ckc query  callers ...   Query the compiled knowledge graph
+//! ckc serve  <path>        Start HTTP API server
+//! ckc mcp    <path>        Start MCP server (JSON-RPC over stdio)
 //! ckc status [path]        Show build statistics
 //! ```
+
+mod mcp;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ckc_core::Compiler;
 use std::path::{Path, PathBuf};
+use std::net::SocketAddr;
 
 #[derive(Parser)]
 #[command(
@@ -63,6 +68,23 @@ enum Command {
         /// Path to the repository root or SQLite database.
         #[arg(default_value = ".")]
         path: PathBuf,
+    },
+
+    /// Start an HTTP API server for querying the knowledge graph.
+    Serve {
+        /// Path to the SQLite database or repository root.
+        #[arg(default_value = ".")]
+        db: PathBuf,
+        /// Address to bind (default: 127.0.0.1:9876).
+        #[arg(short, long, default_value = "127.0.0.1:9876")]
+        addr: SocketAddr,
+    },
+
+    /// Start an MCP (Model Context Protocol) server over stdio.
+    Mcp {
+        /// Path to the SQLite database or repository root.
+        #[arg(default_value = ".")]
+        db: PathBuf,
     },
 }
 
@@ -135,6 +157,8 @@ fn main() -> anyhow::Result<()> {
         Command::Build { path, db, force } => cmd_build(&path, db.as_deref(), force),
         Command::Query { db, sub, json } => cmd_query(&db, sub, json),
         Command::Status { path } => cmd_status(&path),
+        Command::Serve { db, addr } => cmd_serve(&db, addr),
+        Command::Mcp { db } => cmd_mcp(&db),
     }
 }
 
@@ -308,4 +332,120 @@ fn output_nodes(nodes: &[ckc_ir::IrNode], header: &str, json: bool) {
             line = n.location.line_start
         );
     }
+}
+
+// ── HTTP API Server ────────────────────────────────────────────────────────
+
+fn cmd_serve(db: &PathBuf, addr: SocketAddr) -> anyhow::Result<()> {
+    let db_path = resolve_db_path(db)?;
+    if !db_path.exists() {
+        anyhow::bail!("Database not found at {}. Run `ckc build` first.", db_path.display());
+    }
+
+    println!("Starting CKC API server on http://{}", addr);
+    println!("  GET /status         — build statistics");
+    println!("  GET /nodes?kind=    — list nodes");
+    println!("  GET /callers/:name  — find callers");
+    println!("  GET /callees/:name  — find callees");
+    println!("  GET /imports/:file  — list imports");
+    println!("  GET /search?q=      — full-text search");
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let app_state = axum::Router::new()
+            .route("/status", axum::routing::get(status_handler))
+            .route("/nodes", axum::routing::get(nodes_handler))
+            .route("/callers/{name}", axum::routing::get(callers_handler))
+            .route("/callees/{name}", axum::routing::get(callees_handler))
+            .route("/imports/{file}", axum::routing::get(imports_handler))
+            .route("/search", axum::routing::get(search_handler))
+            .layer(tower_http::cors::CorsLayer::permissive())
+            .with_state(db_path.clone());
+
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(listener, app_state).await?;
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    Ok(())
+}
+
+type AppState = PathBuf;
+
+async fn open_store(state: &AppState) -> Result<ckc_graph::GraphStore, axum::http::StatusCode> {
+    ckc_graph::GraphStore::open(state).map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn status_handler(axum::extract::State(state): axum::extract::State<AppState>) -> axum::Json<serde_json::Value> {
+    let store = open_store(&state).await.unwrap();
+    axum::Json(serde_json::json!({
+        "total_nodes": store.total_nodes(),
+        "total_edges": store.total_edges(),
+        "ir_version": store.get_meta("ir_version"),
+    }))
+}
+
+async fn nodes_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::Json<serde_json::Value> {
+    let store = open_store(&state).await.unwrap();
+    let kind = params.get("kind").map(|s| s.as_str());
+    let nodes = store.list_nodes(kind).unwrap_or_default();
+    axum::Json(serde_json::json!(nodes))
+}
+
+async fn callers_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> axum::Json<serde_json::Value> {
+    let store = open_store(&state).await.unwrap();
+    let nodes = store.callers(&name, 1).unwrap_or_default();
+    axum::Json(serde_json::json!(nodes))
+}
+
+async fn callees_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> axum::Json<serde_json::Value> {
+    let store = open_store(&state).await.unwrap();
+    let nodes = store.callees(&name, 1).unwrap_or_default();
+    axum::Json(serde_json::json!(nodes))
+}
+
+async fn imports_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(file): axum::extract::Path<String>,
+) -> axum::Json<serde_json::Value> {
+    let store = open_store(&state).await.unwrap();
+    let edges = store.imports_of_file(&file).unwrap_or_default();
+    axum::Json(serde_json::json!(edges))
+}
+
+async fn search_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::Json<serde_json::Value> {
+    let store = open_store(&state).await.unwrap();
+    let q = params.get("q").map(|s| s.as_str()).unwrap_or("");
+    let nodes = store.search(q).unwrap_or_default();
+    axum::Json(serde_json::json!(nodes))
+}
+
+fn cmd_mcp(db: &PathBuf) -> anyhow::Result<()> {
+    let db_path = resolve_db_path(db)?;
+    if !db_path.exists() {
+        anyhow::bail!("Database not found at {}. Run  first.", db_path.display());
+    }
+    let server = crate::mcp::McpServer::new(&db_path)?;
+    server.run()
+}
+
+fn cmd_mcp(db: &PathBuf) -> anyhow::Result<()> {
+    let db_path = resolve_db_path(db)?;
+    if !db_path.exists() {
+        anyhow::bail!("Database not found at {}. Run  first.", db_path.display());
+    }
+    let server = crate::mcp::McpServer::new(&db_path)?;
+    server.run()
 }

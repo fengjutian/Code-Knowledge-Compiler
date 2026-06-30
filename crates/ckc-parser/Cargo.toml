@@ -8,6 +8,7 @@ license.workspace = true
 ckc-ir = { path = "../ckc-ir" }
 tree-sitter.workspace = true
 tree-sitter-python = "0.23"
+tree-sitter-rust = "0.23"
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

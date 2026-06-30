@@ -11,7 +11,7 @@ mod resolver;
 
 use ckc_graph::GraphStore;
 use ckc_ir::IrBuildResult;
-use ckc_parser::{LanguageParser, ParseError, ParseResult, PythonParser};
+use ckc_parser::{LanguageParser, PythonParser, RustParser};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -35,6 +35,7 @@ fn file_content_hash(path: &Path) -> Result<u64, std::io::Error> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
     Python,
+    Rust,
 }
 
 impl Language {
@@ -42,6 +43,7 @@ impl Language {
     pub fn from_extension(path: &Path) -> Option<Self> {
         match path.extension()?.to_str()? {
             "py" | "pyi" | "pyx" => Some(Language::Python),
+            "rs" => Some(Language::Rust),
             _ => None,
         }
     }
@@ -49,6 +51,7 @@ impl Language {
     pub fn name(&self) -> &str {
         match self {
             Language::Python => "python",
+            Language::Rust => "rust",
         }
     }
 
@@ -56,6 +59,7 @@ impl Language {
     pub fn extensions(&self) -> &[&str] {
         match self {
             Language::Python => &["py", "pyi", "pyx"],
+            Language::Rust => &["rs"],
         }
     }
 }
@@ -145,7 +149,6 @@ impl Compiler {
             None => GraphStore::open_in_memory()?,
         };
 
-        let python_parser = PythonParser::new();
 
         let mut total_nodes = 0u64;
         let mut total_edges = 0u64;
@@ -159,6 +162,7 @@ impl Compiler {
             std::collections::HashMap::new();
 
         for sf in &source_files {
+            let parser = self.parser_for(sf.language);
             #[cfg(feature = "llm")]
             {
                 if let Ok(src) = std::fs::read_to_string(&sf.path) {
@@ -166,7 +170,7 @@ impl Compiler {
                     source_snippets.insert(rel, src);
                 }
             }
-            match self.parse_file(&python_parser, sf) {
+            match parser.parse_file(self.scanner.root(), &sf.path) {
                 Ok(parse_result) => {
                     files_parsed += 1;
                     total_nodes += parse_result.nodes.len() as u64;
@@ -244,7 +248,6 @@ impl Compiler {
             }
         }
 
-        let python_parser = PythonParser::new();
         let mut total_nodes = 0u64;
         let mut total_edges = 0u64;
         let mut files_parsed = 0u64;
@@ -270,7 +273,8 @@ impl Compiler {
                 continue;
             }
 
-            match self.parse_file(&python_parser, sf) {
+            let parser = self.parser_for(sf.language);
+            match parser.parse_file(self.scanner.root(), &sf.path) {
                 Ok(parse_result) => {
                     files_parsed += 1;
                     total_nodes += parse_result.nodes.len() as u64;
@@ -337,7 +341,6 @@ impl Compiler {
             None => GraphStore::open_in_memory()?,
         };
 
-        let python_parser = PythonParser::new();
 
         let mut total_nodes = 0u64;
         let mut total_edges = 0u64;
@@ -365,7 +368,8 @@ impl Compiler {
                 }
             }
 
-            match self.parse_file(&python_parser, sf) {
+            let parser = self.parser_for(sf.language);
+            match parser.parse_file(self.scanner.root(), &sf.path) {
                 Ok(parse_result) => {
                     files_parsed += 1;
                     total_nodes += parse_result.nodes.len() as u64;
@@ -436,11 +440,10 @@ impl Compiler {
         Ok((store, stats, build_result))
     }
 
-    fn parse_file(
-        &self,
-        parser: &dyn LanguageParser,
-        source_file: &SourceFile,
-    ) -> Result<ParseResult, ParseError> {
-        parser.parse_file(self.scanner.root(), &source_file.path)
+    fn parser_for(&self, lang: Language) -> Box<dyn LanguageParser> {
+        match lang {
+            Language::Python => Box::new(PythonParser::new()),
+            Language::Rust => Box::new(RustParser::new()),
+        }
     }
 }
