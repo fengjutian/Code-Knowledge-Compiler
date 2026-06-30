@@ -435,16 +435,7 @@ async fn search_handler(
 fn cmd_mcp(db: &PathBuf) -> anyhow::Result<()> {
     let db_path = resolve_db_path(db)?;
     if !db_path.exists() {
-        anyhow::bail!("Database not found at {}. Run  first.", db_path.display());
-    }
-    let server = crate::mcp::McpServer::new(&db_path)?;
-    server.run()
-}
-
-fn cmd_mcp(db: &PathBuf) -> anyhow::Result<()> {
-    let db_path = resolve_db_path(db)?;
-    if !db_path.exists() {
-        anyhow::bail!("Database not found at {}. Run  first.", db_path.display());
+        anyhow::bail!("Database not found at {}. Run `ckc build` first.", db_path.display());
     }
     let server = crate::mcp::McpServer::new(&db_path)?;
     server.run()
